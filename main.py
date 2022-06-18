@@ -20,7 +20,7 @@ import data_utils as du
 from SSDVAE import SSDVAE
 from DAG import example_tree
 from masked_cross_entropy import masked_cross_entropy
-from data_utils import EOS_TOK, SOS_TOK, PAD_TOK
+from data_utils import EOS_TOK, MAX_EVAL_SEQ_LEN, MIN_EVAL_SEQ_LEN, SOS_TOK, PAD_TOK
 import time
 from torchtext.vocab import GloVe
 from report_md import *
@@ -29,13 +29,54 @@ import gc
 import glob
 import sys
 import os
+from utility import print_repo_info, wandb_log
+from wiki_val_generate import do_ranking
+import wandb
+
+wandb_dict = {}
 
 def tally_parameters(model):
     n_params = sum([p.nelement() for p in model.parameters()])
     print('* number of parameters: %d' % n_params)
+    
+def get_scores_for_frame(model, y_true):
+    def preprocess(frames):
+        # print(frames)
+        frames = list(filter(lambda x: x > 2, frames))
+        frames = list(set(frames))
+        return frames
+
+    def get_score_for_instance(y_true, y_pred):
+        precision = len(set(y_true).intersection(set(y_pred))) / (
+            1 if len(y_pred) == 0 else len(y_pred)
+        )
+        recall = len(set(y_true).intersection(set(y_pred))) / (
+            1 if len(y_true) == 0 else len(y_true)
+        )
+        f1 = (2 * precision * recall) / (
+            1 if (precision + recall) == 0 else (precision + recall)
+        )
+        return precision * 100.0, recall * 100.0, f1 * 100.0
+
+    latent_gumbels = model.latent_gumbels
+    y_pred = torch.argmax(latent_gumbels, dim=-1)
+
+    precision, recall, f1 = 0.0, 0.0, 0.0
+    for y, y_p in zip(y_true, y_pred):
+        n_pre, n_re, n_f1 = get_score_for_instance(
+            preprocess(y.tolist()), preprocess(y_p.tolist())
+        )
+        precision += n_pre
+        recall += n_re
+        f1 += n_f1
+
+    precision /= y_true.size(0)
+    recall /= y_true.size(0)
+    f1 /= y_true.size(0)
+    return precision, recall, f1
 
 
-def monolithic_compute_loss(iteration, model, target, target_lens, latent_values, latent_root, diff, dec_outputs, use_cuda, args, train=True,topics_dict=None,real_sentence=None,next_frames_dict=None,word_to_frame=None,show=False):
+def monolithic_compute_loss(iteration, model, target, target_lens, latent_values, latent_root, diff, dec_outputs, use_cuda, args, train=True,topics_dict=None,real_sentence=None,next_frames_dict=None,word_to_frame=None,show=False, true_f_vals=None):
     """
     use this function for validation loss. NO backprop in this function.
     """
@@ -44,6 +85,7 @@ def monolithic_compute_loss(iteration, model, target, target_lens, latent_values
     frame_classifier = model.frame_classifier
     frame_classifier_total = -frame_classifier.sum((1,2)).mean()
     q_log_q_total= q_log_q.sum(-1).mean()
+    precision, recall, f1 = get_scores_for_frame(model, true_f_vals)
 
     if use_cuda:
         ce_loss = masked_cross_entropy(logits, Variable(target.cuda()), Variable(target_lens.cuda()))
@@ -53,6 +95,36 @@ def monolithic_compute_loss(iteration, model, target, target_lens, latent_values
     loss = ce_loss + q_log_q_total + frame_classifier_total
     if train==True and show==True:
         print_iter_stats(iteration, loss, ce_loss, q_log_q_total,topics_dict,real_sentence,next_frames_dict,frame_classifier_total,word_to_frame,args,show=True)
+        
+    global wandb_dict
+    pre_label = "train" if train else "val"
+    pre = {}
+    if not train:
+        pre = wandb_dict
+    wandb_dict[f"{pre_label}/total_loss"] = loss.item()
+    wandb_dict[f"{pre_label}/loss"] = (
+        pre.get(f"{pre_label}/loss", 0.0) + loss.item()
+    )
+    wandb_dict[f"{pre_label}/ce_loss"] = (
+        pre.get(f"{pre_label}/ce_loss", 0.0) + ce_loss.item()
+    )
+    wandb_dict[f"{pre_label}/kl_loss"] = (
+        pre.get(f"{pre_label}/kl_loss", 0.0) + q_log_q_total.item()
+    )
+    wandb_dict[f"{pre_label}/fcls_loss"] = (
+        pre.get(f"{pre_label}/fcls_loss", 0.0)
+        + frame_classifier_total.item()
+    )
+    wandb_dict[f"{pre_label}/precision"] = (
+        pre.get(f"{pre_label}/precision", 0.0) + precision
+    )
+    wandb_dict[f"{pre_label}/recall"] = (
+        pre.get(f"{pre_label}/recall", 0.0) + recall
+    )
+    wandb_dict[f"{pre_label}/f1"] = (
+        pre.get(f"{pre_label}/f1", 0.0) + f1
+    )
+    
     return loss, ce_loss # tensor
 
 
@@ -72,7 +144,36 @@ def print_iter_stats(iteration, loss, ce_loss, q_log_q_total,topics_dict,real_se
             topics_to_md('words: ',word_to_frame)
             print('-'*50)
 
+def get_wiki_inv_score(args, train, models, vocab, vocab2, pre=""):
+    data_mode = "train" if train else "valid"
+    valid_narr = "./data/wiki_inv/obs_{}_0.6_TUP_DIST.txt".format(data_mode)
+    dataset_wiki = du.NarrativeClozeDataset(
+        valid_narr,
+        vocab,
+        src_seq_length=MAX_EVAL_SEQ_LEN,
+        min_seq_length=MIN_EVAL_SEQ_LEN,
+        LM=False,
+    )
+    wiki_data_len = len(dataset_wiki)
+    print(f"{pre}ranking_dataset: ", wiki_data_len)
+    # Batch size during decoding is set to 1
+    wiki_batches = BatchIter(
+        dataset_wiki, 1, sort_key=lambda x: len(x.actual), train=False, device=-1
+    )
+    wiki_acc = do_ranking(
+        args,
+        models,
+        wiki_batches,
+        vocab,
+        wiki_data_len,
+        True,
+    )
 
+    pre_label = "train" if train else "val"
+    global wandb_dict
+    wandb_dict[f"{pre_label}/{pre}wiki_inv"] = wiki_acc
+
+    return wiki_acc
 
 
 def check_save_model_path(save_model):
@@ -84,6 +185,7 @@ def check_save_model_path(save_model):
 
 
 def classic_train(args,args_dict,args_info):
+    global wandb_dict
     """
     Train the model in the ol' fashioned way, just like grandma used to
     Args
@@ -112,9 +214,6 @@ def classic_train(args,args_dict,args_info):
     args.total_frames=total_frames
     args.num_latent_values=args.total_frames
     print('total frames: ',args.total_frames)
-    experiment_name = 'SSDVAE_wotemp_{}_eps_{}_num_{}_seed_{}'.format('chain_event',str(args_dict['obsv_prob']),str(args_dict['exp_num']),str(args_dict['seed']))
-
-    experiment_name = '{}_eps_{}_num_{}_seed_{}'.format('chain_event',str(args_dict['obsv_prob']),str(args_dict['exp_num']),str(args_dict['seed']))
 
     if args.use_pretrained:
         pretrained = GloVe(name='6B', dim=args.emb_size, unk_init=torch.Tensor.normal_)
@@ -142,6 +241,7 @@ def classic_train(args,args_dict,args_info):
         model = SSDVAE(args.emb_size, hidsize, vocab, latents, layers=args.nlayers, use_cuda=use_cuda,
                       pretrained=args.use_pretrained, dropout=args.dropout,frame_max=args.total_frames,
                       latent_dim=args.latent_dim,verb_max_idx=verb_max_idx)
+        # wandb.watch(model, log="all")
 
 
 
@@ -177,6 +277,10 @@ def classic_train(args,args_dict,args_info):
     print('Model_named_params:{}'.format(model.named_parameters()))
 
     for iteration, bl in enumerate(batches): #this will continue on forever (shuffling every epoch) till epochs finished
+        wandb_dict = {}
+        wandb_dict["epoch"] = curr_epoch
+        wandb_dict["iteration"] = iteration
+        
         batch, batch_lens = bl.text
         f_vals,f_vals_lens = bl.frame
         target, target_lens = bl.target
@@ -195,7 +299,7 @@ def classic_train(args,args_dict,args_info):
         topics_dict,real_sentence,next_frames_dict,word_to_frame=show_inference(model,batch,vocab,vocab2,f_vals,f_ref,args)
         loss, _ = monolithic_compute_loss(iteration, model, target, target_lens, latent_values, latent_root,
                                           diff, dec_outputs, use_cuda, args=args,topics_dict=topics_dict,real_sentence=real_sentence,next_frames_dict=next_frames_dict,
-                                          word_to_frame=word_to_frame,train=True,show=True)
+                                          word_to_frame=word_to_frame,train=True,show=True, true_f_vals=f_ref)
 
         # backward propagation
         loss.backward()
@@ -211,6 +315,7 @@ def classic_train(args,args_dict,args_info):
             valid_logprobs=0.0
             valid_lengths=0.0
             valid_loss = 0.0
+            valid_batch_total_size = 0
             with torch.no_grad():
                 for v_iteration, bl in enumerate(val_batches):
                     batch, batch_lens = bl.text
@@ -228,15 +333,27 @@ def classic_train(args,args_dict,args_info):
                     topics_dict,real_sentence,next_frames_dict,word_to_frame=show_inference(model,batch,vocab,vocab2,f_vals,f_ref,args)
                     loss, ce_loss = monolithic_compute_loss(iteration, model, target, target_lens, latent_values, latent_root,
                                                     diff, dec_outputs, use_cuda, args=args,topics_dict=topics_dict,real_sentence=real_sentence,next_frames_dict=next_frames_dict,
-                                                    word_to_frame=word_to_frame,train=False,show=False)
+                                                    word_to_frame=word_to_frame,train=False,show=False, true_f_vals=f_ref)
 
                     valid_loss = valid_loss + ce_loss.data.clone()
                     valid_logprobs+=ce_loss.data.clone().cpu().numpy()*target_lens.sum().cpu().data.numpy()
                     valid_lengths+=target_lens.sum().cpu().data.numpy()
                     # print("valid_lengths: ",valid_lengths[0])
+                    valid_batch_total_size += 1
 
             nll=valid_logprobs/valid_lengths
             ppl=np.exp(nll)
+            
+            wandb_dict["val/nll"] = nll
+            wandb_dict["val/ppl"] = ppl
+            wandb_dict[f"val/loss"] /= valid_batch_total_size
+            wandb_dict[f"val/ce_loss"] /= valid_batch_total_size
+            wandb_dict[f"val/kl_loss"] /= valid_batch_total_size
+            wandb_dict[f"val/fcls_loss"] /= valid_batch_total_size
+            wandb_dict[f"val/precision"] /= valid_batch_total_size
+            wandb_dict[f"val/recall"] /= valid_batch_total_size
+            wandb_dict[f"val/f1"] /= valid_batch_total_size
+            
             valid_loss = valid_loss/(v_iteration+1)
             print("**Validation loss {:.2f}.**\n".format(valid_loss.item()))
             print("**Validation NLL {:.2f}.**\n".format(nll))
@@ -254,6 +371,10 @@ def classic_train(args,args_dict,args_info):
                 with open (config_path, "wb") as f:
                     pickle.dump((args_dict,args_info),f)
             print('\t==> min_ppl {:4.4f} '.format(min_ppl))
+            
+            get_wiki_inv_score(args, False, model, vocab, vocab2)
+        
+        wandb_log(wandb_dict)
 
 
 
@@ -296,6 +417,7 @@ if __name__ == "__main__":
     parser.add_argument('--frame_max', type=int, default=500)
     parser.add_argument('--obsv_prob', type=float, default=1.0,help='the percentage of observing frames')
     parser.add_argument('--exp_num', type=int, default=1)
+    parser.add_argument('--max_decode', type=int, default=10, help="""max sentences to be evaluated/decoded.""")
 
 
     args = parser.parse_args()
@@ -313,6 +435,8 @@ if __name__ == "__main__":
     args.vocab='./data/vocab_40064_verb_max_13572.pkl'
     args.frame_vocab_address='./data/vocab_frame_'+str(args.frame_max)+'.pkl'
     args.frame_vocab_ref='./data/vocab_frame_all.pkl'
+    
+    print_repo_info()
 
 
     args.latent_dim=args.frame_max
@@ -343,6 +467,14 @@ if __name__ == "__main__":
          "latent_dim","dropout","bidir","use_pretrained","obsv_prob","frame_max","exp_num","seed"]
     args_dict={key:str(value) for key,value in vars(args).items() if key in keys}
 
+    experiment_name = f"NAACL_{args_dict['exp_num']}"
+    wandb.init(
+        project="SSDVAE_ext",
+        entity="ssdvae-hierarchical",
+        name=experiment_name,
+        config=args_info,
+    )
+    
     classic_train(args,args_dict,args_info)
 
 

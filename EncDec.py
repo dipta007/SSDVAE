@@ -131,7 +131,7 @@ class Attention(nn.Module):
                 mask = mask.unsqueeze(1).cuda()  # Make broadcastable.
             else:
                 mask = mask.unsqueeze(1)
-            scores.data.masked_fill_(1 - mask, -float('inf'))
+            scores.data.masked_fill_(~mask, -float('inf'))
 
 
         if self.use_cuda:

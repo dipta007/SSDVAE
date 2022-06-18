@@ -4,8 +4,7 @@ conda activate pytorch-gpu-0.4.1
 sh_name=$(basename -- "$0")
 current_dir=$(pwd)
 sh_file=$(hostname):$current_dir/$sh_name
-CUDA_VISIBLE_DEVICES=2\
-    python main.py\
+python main.py\
     --obsv_prob "${1}"\
     --exp_num "${2}"\
     --seed "${3}"\

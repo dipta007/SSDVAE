@@ -61,10 +61,10 @@ def monolithic_compute_loss(iteration, model, target, target_lens, latent_values
 def print_iter_stats(iteration, loss, ce_loss, q_log_q_total,topics_dict,real_sentence,next_frames_dict,frame_classifier_total,word_to_frame,args,show=False):
     if iteration%10==0:
         print("Iteration: ", iteration)
-        print("Total: ", loss.cpu().data[0])
-        print("CE: ", ce_loss.cpu().data[0])
-        print("q_log_q_total: ",q_log_q_total.cpu().data[0])
-        print("frame_classifier_total: ",frame_classifier_total.cpu().data[0])
+        print("Total: ", loss.cpu().item())
+        print("CE: ", ce_loss.cpu().item())
+        print("q_log_q_total: ",q_log_q_total.cpu().item())
+        print("frame_classifier_total: ",frame_classifier_total.cpu().item())
         print('-'*50)
         if False:
             print("sentence: "," ".join(real_sentence))
@@ -238,7 +238,7 @@ def classic_train(args,args_dict,args_info):
             nll=valid_logprobs/valid_lengths
             ppl=np.exp(nll)
             valid_loss = valid_loss/(v_iteration+1)
-            print("**Validation loss {:.2f}.**\n".format(valid_loss[0]))
+            print("**Validation loss {:.2f}.**\n".format(valid_loss.item()))
             print("**Validation NLL {:.2f}.**\n".format(nll))
             print("**Validation PPL {:.2f}.**\n".format(ppl))
             args_dict_wandb = {"val_nll":nll,"val_ppl":ppl,"valid_loss":valid_loss}

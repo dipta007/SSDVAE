@@ -67,9 +67,6 @@ def wandb_alert(title, text="", level=AlertLevel.INFO):
 
 
 def wandb_log(wandb_dict):
-    print("*" * 44)
-    print(wandb_dict)
-    print("*" * 44)
     try:
         wandb.log(wandb_dict)
     except Exception as e:
